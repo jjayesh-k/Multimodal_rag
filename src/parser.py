@@ -114,16 +114,16 @@ class SmartMultiColumnParser:
         return chunk
 
 if __name__ == "__main__":
-    pdf_filename = r"D:\JK\RAG\RAG_APP_FINAL\input_files\Tata Code Of Conduct.pdf" 
+    pdf_filename = r"/workspaces/Multimodal_rag/Tata Code Of Conduct.pdf" 
 
     if os.path.exists(pdf_filename):
         parser = SmartMultiColumnParser()
         result_chunks = parser.parse_and_chunk(pdf_filename)
 
-        print(f"\n✅ Successfully created {len(result_chunks)} chunks.")
+        print(f"\nSuccessfully created {len(result_chunks)} chunks.")
         
         # Preview specific types
         tables = [c for c in result_chunks if c.chunk_type == 'table']
-        print(f"📊 Found {len(tables)} intact tables!")
+        print(f"Found {len(tables)} intact tables!")
     else:
-        print(f"❌ File '{pdf_filename}' not found.")
+        print(f"File '{pdf_filename}' not found.")
