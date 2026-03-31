@@ -7,6 +7,7 @@ import time
 from dotenv import load_dotenv
 import shutil
 from collections import Counter
+from fastapi.middleware.cors import CORSMiddleware
 
 # Import our highly tuned hybrid retriever
 import src.retriever as retriever
@@ -19,17 +20,16 @@ SERVER_START_TIME = time.time()
 # Load environment variables
 load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-LOCAL_OLLAMA_URL = os.getenv("LOCAL_OLLAMA_URL") # Fetched from your .env (ngrok URL)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") # Replacing Ollama with Groq
 
 # --- 1. Failover Model List ---
 FREE_MODELS = [
+    "google/gemini-2.0-flash-lite-preview-02-05:free", # Added Gemini for stability
     "meta-llama/llama-3.3-70b-instruct:free",
     "google/gemma-3n-e4b-it:free",
-    "google/gemma-3n-e2b-it:free",
     "qwen/qwen3-coder:free",
     "meta-llama/llama-3.2-3b-instruct:free",
-    "openai/gpt-oss-120b:free",
-    "nousresearch/hermes-3-llama-3.1-405b:free"
+    "openai/gpt-oss-120b:free"
 ]
 
 # --- Pydantic Models ---
@@ -38,6 +38,7 @@ class QueryRequest(BaseModel):
     top_k: Optional[int] = 5
 
 class SourceCitation(BaseModel):
+    filename: str
     chunk_type: str
     page: str
     score: float
@@ -51,9 +52,17 @@ class QueryResponse(BaseModel):
 # --- Initialize FastAPI ---
 app = FastAPI(
     title="Automotive Multimodal RAG API",
-    description="Hybrid Search with Cloud-to-Local Failover",
+    description="Hybrid Search with Cloud-to-Groq Failover",
     version="1.2.0"
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # In production, replace "*" with your frontend's URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)   
 
 @app.on_event("startup")
 async def startup_event():
@@ -79,18 +88,9 @@ async def health_check():
     Returns system status: model readiness, number of indexed documents, 
     index size, and server uptime.
     """
-    # 1. Calculate Uptime
     uptime_seconds = round(time.time() - SERVER_START_TIME, 2)
-    
-    # 2. Check Model Readiness
-    # If VECTOR_INDEX is not None, the Granite embedder and FAISS are loaded
     is_ready = retriever.VECTOR_INDEX is not None
-    
-    # 3. Get Indexed Document (Chunk) Count
-    # Safely check the length of the CHUNK_MAP dictionary
     num_chunks = len(retriever.CHUNK_MAP) if retriever.CHUNK_MAP else 0
-    
-    # 4. Calculate Index Size on Disk
     index_size_mb = get_index_size_mb("./index_storage")
 
     return {
@@ -102,7 +102,6 @@ async def health_check():
         "uptime_seconds": uptime_seconds
     }
 
-# Create a standalone function for the heavy lifting
 def process_pdf_in_background(temp_pdf_path: str, filename: str):
     try:
         print(f"\nBackground Processing Started for: {filename}")
@@ -115,6 +114,14 @@ def process_pdf_in_background(temp_pdf_path: str, filename: str):
         if not extracted_chunks:
             print("Failed to extract any content.")
             return
+
+        # Inject the actual filename into metadata so it passes to the citation layer
+        for chunk in extracted_chunks:
+            if hasattr(chunk, 'metadata'):
+                chunk.metadata['source'] = filename
+            elif isinstance(chunk, dict):
+                if 'metadata' not in chunk: chunk['metadata'] = {}
+                chunk['metadata']['source'] = filename
 
         # 2. Embed and Index
         print("\nSending chunks to Vector Indexer...")
@@ -131,31 +138,23 @@ def process_pdf_in_background(temp_pdf_path: str, filename: str):
         print(f"Background Ingestion Error: {e}")
         
     finally:
-        # Cleanup
         if os.path.exists(temp_pdf_path):
             os.remove(temp_pdf_path)
             print("Cleaned up temporary files.")
 
 
-# Your new, lightning-fast endpoint
 @app.post("/ingest")
 async def ingest_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """
-    Accepts a PDF and hands it off to a background worker to prevent 504 Timeouts.
-    """
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     temp_pdf_path = f"temp_{file.filename}"
     
-    # Save the file quickly
     with open(temp_pdf_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
         
-    # Hand the heavy lifting to FastAPI's background worker
     background_tasks.add_task(process_pdf_in_background, temp_pdf_path, file.filename)
     
-    # Return immediately to the user
     return {
         "message": f"File '{file.filename}' received successfully! Processing has started in the background.",
         "status": "Processing",
@@ -164,7 +163,6 @@ async def ingest_document(background_tasks: BackgroundTasks, file: UploadFile = 
 
 @app.post("/query", response_model=QueryResponse)
 async def query_rag_system(request: QueryRequest):
-    # 1. Retrieve the best multimodal chunks
     retrieved_chunks = perform_hybrid_search(request.question, k=request.top_k)
     
     if not retrieved_chunks:
@@ -174,28 +172,32 @@ async def query_rag_system(request: QueryRequest):
             model_used="None"
         )
 
-    # 2. Format the context for the LLM
     context_text = ""
     sources = []
     for i, chunk in enumerate(retrieved_chunks):
         page_num = str(chunk.get("metadata", {}).get("page", "Unknown"))
+        file_name = chunk.get("metadata", {}).get("source", "Indexed_Document.pdf") 
         c_type = chunk.get("chunk_type", "text")
         content = chunk.get("content", "")
         
-        context_text += f"\n--- SOURCE {i+1} (Type: {c_type}, Page: {page_num}) ---\n{content}\n"
+        context_text += f"\n--- SOURCE {i+1} (File: {file_name}, Type: {c_type}, Page: {page_num}) ---\n{content}\n"
+        
         sources.append(SourceCitation(
-            chunk_type=c_type, page=page_num,
+            filename=file_name,
+            chunk_type=c_type, 
+            page=page_num,
             score=chunk.get("search_score", 0.0),
             preview=content[:100] + "..."
         ))
 
-    # 3. System Prompt
     system_prompt = """You are an expert Automotive Diagnostic AI. 
     Answer the user's question using ONLY the provided context. 
-    Explicitly cite the Page Number (e.g., "According to Page 2...").
+    You MUST explicitly cite your sources in your answer using bold markdown.
+    Format your citations exactly like this: **[File: <filename>, Page: <page>, Type: <type>]**.
+    Example: "The torque specification is 50Nm **[File: Service_Manual.pdf, Page: 12, Type: table]**."
     If the context doesn't have the answer, say you don't know."""
 
-    # 4. Phase 1: Cloud Failover Loop (OpenRouter)
+    # Phase 1: Cloud Failover Loop (OpenRouter)
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "HTTP-Referer": "https://github.com/jjayesh-k",
@@ -242,47 +244,49 @@ async def query_rag_system(request: QueryRequest):
             last_error = str(e)
             continue
 
-    # 5. Phase 2: Local Fallback (Ollama @ Home)
-    # This runs only if the entire Cloud loop fails
-    if LOCAL_OLLAMA_URL:
+    # Phase 2: Reliable Fallback (Groq API)
+    if GROQ_API_KEY:
         try:
-            print(f"Cloud exhausted. Phoning home to Local RTX 4060...")
+            print("☁️ Cloud exhausted. Falling back to ultra-fast Groq API...")
             
-            # The secret key to bypassing the ngrok warning page
-            local_headers = {
-                "ngrok-skip-browser-warning": "true"
+            groq_headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
             }
 
-            # Ollama native generation format
-            ollama_payload = {
-                "model": "mistral:7b",
-                "prompt": f"SYSTEM: {system_prompt}\n\nCONTEXT:\n{context_text}\n\nUSER QUESTION: {request.question}",
-                "stream": False
+            groq_payload = {
+                "model": "llama-3.3-70b-versatile", 
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"CONTEXT:\n{context_text}\n\nQUESTION: {request.question}"}
+                ],
+                "temperature": 0.1
             }
 
-            local_response = requests.post(
-                f"{LOCAL_OLLAMA_URL}/api/generate",
-                headers=local_headers,
-                json=ollama_payload,
-                timeout=60 # Local inference can take a bit longer than cloud
+            groq_response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=groq_headers,
+                json=groq_payload,
+                timeout=15 
             )
 
-            if local_response.status_code == 200:
-                answer_text = local_response.json().get("response", "")
-                print(f"Local Fallback Success: mistral:7b")
+            if groq_response.status_code == 200:
+                answer_text = groq_response.json()["choices"][0]["message"]["content"]
+                print(f"✅ Groq Fallback Success!")
                 return QueryResponse(
                     answer=answer_text,
                     sources=sources,
-                    model_used="Local: mistral:7b (via Ngrok)"
+                    model_used="Groq API: llama3-8b-8192"
                 )
             else:
-                print(f"Local Ollama returned error: {local_response.status_code}")
-                last_error += f" | Local Error: {local_response.text}"
+                print(f"❌ Groq returned error: {groq_response.status_code}")
+                last_error += f" | Groq Error: {groq_response.text}"
+                
         except Exception as e:
-            print(f"Local Fallback failed: {e}")
-            last_error += f" | Local Exception: {str(e)}"
+            print(f"❌ Groq Fallback failed: {e}")
+            last_error += f" | Groq Exception: {str(e)}"
 
-    # 6. Final Exception if both Cloud and Local are unreachable
+    # Final Exception if ALL clouds are completely down
     raise HTTPException(
         status_code=503, 
         detail=f"All resources exhausted. Last recorded error: {last_error}"

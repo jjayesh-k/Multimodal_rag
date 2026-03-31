@@ -1,0 +1,21 @@
+# Web Server & API
+fastapi==0.110.0
+uvicorn==0.29.0
+python-multipart==0.0.9
+pydantic==2.6.4
+
+# Environment & Networking
+python-dotenv==1.0.1
+requests==2.31.0
+
+# Vector Store & Search
+faiss-cpu==1.8.0
+numpy==1.26.4
+
+# Embeddings & Machine Learning
+sentence-transformers==2.6.1
+torch==2.2.2
+
+# Document Parsing (Bootcamp standard)
+docling==1.16.0
+Pillow==10.3.0
