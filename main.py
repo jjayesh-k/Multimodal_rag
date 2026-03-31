@@ -1,13 +1,20 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks
 from pydantic import BaseModel
 from typing import List, Optional
 import os
 import requests
 import time
 from dotenv import load_dotenv
+import shutil
+from collections import Counter
 
 # Import our highly tuned hybrid retriever
+import src.retriever as retriever
 from src.retriever import perform_hybrid_search, load_indexes
+from src.parser import SmartMultiColumnParser
+from src.indexer import build_rag_index
+
+SERVER_START_TIME = time.time()
 
 # Load environment variables
 load_dotenv()
@@ -50,14 +57,110 @@ app = FastAPI(
 
 @app.on_event("startup")
 async def startup_event():
-    print("🚀 Starting FastAPI Server...")
+    print("Starting FastAPI Server...")
     success = load_indexes("./index_storage")
     if not success:
-        print("⚠️ WARNING: Indexes not found.")
+        print("WARNING: Indexes not found.")
+
+def get_index_size_mb(directory_path: str = "./index_storage") -> float:
+    """Calculates the total size of a directory in Megabytes."""
+    total_size = 0
+    if os.path.exists(directory_path):
+        for dirpath, _, filenames in os.walk(directory_path):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                if not os.path.islink(fp):
+                    total_size += os.path.getsize(fp)
+    return round(total_size / (1024 * 1024), 2)
 
 @app.get("/health")
 async def health_check():
-    return {"status": "online", "system": "Automotive RAG Pipeline active"}
+    """
+    Returns system status: model readiness, number of indexed documents, 
+    index size, and server uptime.
+    """
+    # 1. Calculate Uptime
+    uptime_seconds = round(time.time() - SERVER_START_TIME, 2)
+    
+    # 2. Check Model Readiness
+    # If VECTOR_INDEX is not None, the Granite embedder and FAISS are loaded
+    is_ready = retriever.VECTOR_INDEX is not None
+    
+    # 3. Get Indexed Document (Chunk) Count
+    # Safely check the length of the CHUNK_MAP dictionary
+    num_chunks = len(retriever.CHUNK_MAP) if retriever.CHUNK_MAP else 0
+    
+    # 4. Calculate Index Size on Disk
+    index_size_mb = get_index_size_mb("./index_storage")
+
+    return {
+        "status": "online",
+        "system": "Automotive RAG Pipeline active",
+        "model_readiness": "ready" if is_ready else "not_loaded",
+        "number_of_indexed_chunks": num_chunks,
+        "index_size_mb": index_size_mb,
+        "uptime_seconds": uptime_seconds
+    }
+
+# Create a standalone function for the heavy lifting
+def process_pdf_in_background(temp_pdf_path: str, filename: str):
+    try:
+        print(f"\nBackground Processing Started for: {filename}")
+        start_time = time.time()
+
+        # 1. Parse and Extract
+        parser = SmartMultiColumnParser()
+        extracted_chunks = parser.parse_and_chunk(temp_pdf_path, verbose=True)
+        
+        if not extracted_chunks:
+            print("Failed to extract any content.")
+            return
+
+        # 2. Embed and Index
+        print("\nSending chunks to Vector Indexer...")
+        build_rag_index(extracted_chunks, save_dir="./index_storage")
+
+        # 3. Hot-Reload
+        print("Reloading retriever indexes into memory...")
+        load_indexes(save_dir="./index_storage")
+
+        processing_time = round(time.time() - start_time, 2)
+        print(f"SUCCESS: Ingestion complete in {processing_time} seconds!")
+
+    except Exception as e:
+        print(f"Background Ingestion Error: {e}")
+        
+    finally:
+        # Cleanup
+        if os.path.exists(temp_pdf_path):
+            os.remove(temp_pdf_path)
+            print("Cleaned up temporary files.")
+
+
+# Your new, lightning-fast endpoint
+@app.post("/ingest")
+async def ingest_document(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """
+    Accepts a PDF and hands it off to a background worker to prevent 504 Timeouts.
+    """
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
+    temp_pdf_path = f"temp_{file.filename}"
+    
+    # Save the file quickly
+    with open(temp_pdf_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    # Hand the heavy lifting to FastAPI's background worker
+    background_tasks.add_task(process_pdf_in_background, temp_pdf_path, file.filename)
+    
+    # Return immediately to the user
+    return {
+        "message": f"File '{file.filename}' received successfully! Processing has started in the background.",
+        "status": "Processing",
+        "tip": "Check your terminal to see the live extraction progress."
+    }
 
 @app.post("/query", response_model=QueryResponse)
 async def query_rag_system(request: QueryRequest):
@@ -123,19 +226,19 @@ async def query_rag_system(request: QueryRequest):
 
             if response.status_code == 200:
                 answer_text = response.json()["choices"][0]["message"]["content"]
-                print(f"✅ Cloud Success: {model_id}")
+                print(f"Cloud Success: {model_id}")
                 return QueryResponse(
                     answer=answer_text,
                     sources=sources,
                     model_used=f"Cloud: {model_id}"
                 )
             else:
-                print(f"⚠️ Cloud {model_id} busy (Status {response.status_code}).")
+                print(f"Cloud {model_id} busy (Status {response.status_code}).")
                 last_error = response.text
                 continue
 
         except Exception as e:
-            print(f"❌ Cloud Connection error: {e}")
+            print(f"Cloud Connection error: {e}")
             last_error = str(e)
             continue
 
@@ -166,17 +269,17 @@ async def query_rag_system(request: QueryRequest):
 
             if local_response.status_code == 200:
                 answer_text = local_response.json().get("response", "")
-                print(f"✅ Local Fallback Success: mistral:7b")
+                print(f"Local Fallback Success: mistral:7b")
                 return QueryResponse(
                     answer=answer_text,
                     sources=sources,
                     model_used="Local: mistral:7b (via Ngrok)"
                 )
             else:
-                print(f"❌ Local Ollama returned error: {local_response.status_code}")
+                print(f"Local Ollama returned error: {local_response.status_code}")
                 last_error += f" | Local Error: {local_response.text}"
         except Exception as e:
-            print(f"❌ Local Fallback failed: {e}")
+            print(f"Local Fallback failed: {e}")
             last_error += f" | Local Exception: {str(e)}"
 
     # 6. Final Exception if both Cloud and Local are unreachable

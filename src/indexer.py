@@ -4,15 +4,11 @@ from rank_bm25 import BM25Okapi
 import re
 import os
 import pickle
-from dotenv import load_dotenv
-from huggingface_hub import InferenceClient
+from sentence_transformers import SentenceTransformer
 
-# Load the API keys from .env
-load_dotenv()
-HF_TOKEN = os.getenv("HF_TOKEN")
-
-# Initialize the official Hugging Face SDK Client
-hf_client = InferenceClient(token=HF_TOKEN)
+# Initialize the IBM Granite Embedder locally (Runs incredibly fast on CPU)
+print("[Init] Loading IBM Granite 30M Embedder...")
+embedder = SentenceTransformer("ibm-granite/granite-embedding-30m-english")
 
 def simple_tokenize(text):
     """Preserves numbers and acronyms for BM25 Keyword Search"""
@@ -23,11 +19,11 @@ def simple_tokenize(text):
 def build_rag_index(parsed_chunks, save_dir="./index_storage"):
     """
     Accepts a list of ParsedChunk objects (or dicts) with metadata.
-    Builds FAISS HNSW and BM25 indexes, and saves them to disk.
+    Builds FAISS HNSW and BM25 indexes using Granite 30M, and saves them to disk.
     """
     os.makedirs(save_dir, exist_ok=True)
     
-    print(f"[Indexer] Using Hugging Face Inference API for MiniLM Embeddings")
+    print(f"[Indexer] Using Local IBM Granite-30M for Embeddings")
     if not parsed_chunks:
         print("[Indexer] No chunks to index.")
         return None, None, {}
@@ -35,35 +31,24 @@ def build_rag_index(parsed_chunks, save_dir="./index_storage"):
     valid_embeddings = []
     valid_chunks = [] 
     
-    BATCH_SIZE = 10 
+    BATCH_SIZE = 16 # Increased batch size since we run locally now
     
-    # 1. SAFE EMBEDDING LOOP (Official SDK Version)
+    # 1. LOCAL EMBEDDING LOOP 
     for i in range(0, len(parsed_chunks), BATCH_SIZE):
         batch = parsed_chunks[i : i + BATCH_SIZE]
+        # Handle both dictionary (mock) and object (real parser) formats
         batch_text = [chunk.content if hasattr(chunk, 'content') else chunk['content'] for chunk in batch]
         
         try:
-            # Swapped to MiniLM - The most stable free model on Hugging Face
-            batch_vectors = hf_client.feature_extraction(
-                text=batch_text,
-                model="sentence-transformers/all-MiniLM-L6-v2"
-            )
+            # Encode locally with Granite. normalize_embeddings=True is highly recommended!
+            batch_vectors = embedder.encode(batch_text, normalize_embeddings=True)
             
-            # The SDK might return a numpy array, ensure it's a list
-            if isinstance(batch_vectors, np.ndarray):
-                batch_vectors = batch_vectors.tolist()
-            
-            if len(batch_vectors) != len(batch_text):
-                print(f"Mismatch in Batch {i}. Skipping batch to maintain alignment.")
-                continue
-
-            valid_embeddings.extend(batch_vectors)
+            valid_embeddings.extend(batch_vectors.tolist())
             valid_chunks.extend(batch) 
-            print(f"   -> Successfully embedded chunks {i} to {i+len(batch_text)-1} via Hugging Face SDK!")
+            print(f"   -> Successfully embedded chunks {i} to {i+len(batch_text)-1}")
             
         except Exception as e:
-            print(f"Error embedding batch {i}: {e}")
-            print("Tip: If the error is empty, the HF server is waking up. Try running it one more time.")
+            print(f"❌ Error embedding batch {i}: {e}")
             continue
 
     if not valid_embeddings:
@@ -71,7 +56,8 @@ def build_rag_index(parsed_chunks, save_dir="./index_storage"):
         return None, None, {}
 
     # 2. BUILD FAISS HNSW (Graph) INDEX
-    dimension = len(valid_embeddings[0])
+    dimension = len(valid_embeddings[0]) # Granite uses 512 dimensions (MiniLM used 384)
+    print(f"[Indexer] Building FAISS Index with {dimension} dimensions...")
     np_embeddings = np.array(valid_embeddings).astype('float32')
     
     vector_index = faiss.IndexHNSWFlat(dimension, 32)
@@ -128,14 +114,14 @@ if __name__ == "__main__":
     vector_idx, bm25_idx, chunk_mapping = build_rag_index(mock_parsed_chunks, save_dir=save_directory)
 
     if vector_idx and bm25_idx and chunk_mapping:
-        print("\n✅ Verification Successful!")
-        print(f"📁 Files saved in: {os.path.abspath(save_directory)}")
+        print("\nVerification Successful!")
+        print(f"Files saved in: {os.path.abspath(save_directory)}")
         print(f"   - faiss_hnsw.index exists: {os.path.exists(os.path.join(save_directory, 'faiss_hnsw.index'))}")
         print(f"   - bm25.pkl exists: {os.path.exists(os.path.join(save_directory, 'bm25.pkl'))}")
         print(f"   - chunk_map.pkl exists: {os.path.exists(os.path.join(save_directory, 'chunk_map.pkl'))}")
-        print("\n🔍 Inspecting Metadata for Chunk ID 1:")
+        print("\nInspecting Metadata for Chunk ID 1:")
         print(f"Chunk Type: {chunk_mapping[1]['chunk_type']}")
         print(f"Source Page: {chunk_mapping[1]['metadata']['page']}")
         print(f"Content Preview: {chunk_mapping[1]['content'][:40]}...")
     else:
-        print("\n❌ Indexing failed. Check your HF_TOKEN and internet connection.")
+        print("\nIndexing failed.")
